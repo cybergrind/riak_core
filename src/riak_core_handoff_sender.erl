@@ -22,6 +22,7 @@
 
 -module(riak_core_handoff_sender).
 -export([start_link/4, get_handoff_ssl_options/0]).
+-include("riak_core_locks.hrl").
 -include("riak_core_vnode.hrl").
 -include("riak_core_handoff.hrl").
 -define(ACK_COUNT, 1000).
@@ -92,7 +93,19 @@ start_fold(TargetNode, Module, {Type, Opts}, ParentPid, SslOpts) ->
     SrcNode = node(),
     SrcPartition = get_src_partition(Opts),
     TargetPartition = get_target_partition(Opts),
-     try
+    %% Take per-vnode concurrency limit "lock". It will be released when this process exists/dies.
+    case riak_core_bg_manager:get_lock(?VNODE_LOCK(SrcPartition), self(), [{task, handoff}]) of
+        max_concurrency ->
+            %% shared lock not registered yet or limit reached.  Failing with
+            %% max_concurrency will cause this partition to be retried again later.
+            exit({shutdown, max_concurrency});
+        _Ref ->
+            %% Our process is now being monitored, so the lock will be released
+            %% if we crash.
+            ok
+    end,
+
+    try
          Filter = get_filter(Opts),
          [_Name,Host] = string:tokens(atom_to_list(TargetNode), "@"),
          {ok, Port} = get_handoff_port(TargetNode),

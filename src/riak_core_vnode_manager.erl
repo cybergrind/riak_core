@@ -71,6 +71,7 @@
 
 -include("riak_core_handoff.hrl").
 -include("riak_core_vnode.hrl").
+-include("riak_core_locks.hrl").
 -define(XFER_EQ(A, ModSrcTgt), A#xfer_status.mod_src_target == ModSrcTgt).
 -define(XFER_COMPLETE(X), X#xfer_status.status == complete).
 -define(DEFAULT_OWNERSHIP_TRIGGER, 8).
@@ -404,6 +405,9 @@ handle_cast({kill_repairs, Reason}, State) ->
 handle_cast(_, State) ->
     {noreply, State}.
 
+handle_info({set_concurrency_limit, Lock, Limit}, State) ->
+    try_set_concurrency_limit(Lock, Limit),
+    {noreply, State};
 handle_info(management_tick, State0) ->
     schedule_management_timer(),
     RingID = riak_core_ring_manager:get_ring_id(),
@@ -563,6 +567,36 @@ delmon(MonRef, _State=#state{idxtab=T}) ->
 add_vnode_rec(I,  _State=#state{idxtab=T}) -> ets:insert(T,I).
 
 %% @private
+%% @doc Try to register a per-vnode concurrency limit "lock" for Idx. If the
+%%      background manager is not available yet, schedule a retry for later.
+%%      If the application environment has a non "false" setting of the key
+%%      'skip_background_manager', then this code just returns ok without
+%%      registering.
+try_set_concurrency_limit(Lock, Limit) ->
+    UseBgMgr =
+        case application:get_env(riak_core, skip_background_manager) of
+            {ok, false} -> true;
+            {ok, _Other} -> false;
+            undefined -> true
+        end,
+    try_set_concurrency_limit(Lock, Limit, UseBgMgr).
+
+try_set_concurrency_limit(_Lock, _Limit, false) ->
+    lager:info("Skipping background manager."),
+    ok;
+try_set_concurrency_limit(Lock, Limit, true) ->
+    %% this is ok to do more than once
+    case riak_core_bg_manager:set_concurrency_limit(Lock, Limit) of
+        0 ->
+            %% not ready yet, try again later
+            lager:info("Background manager not ready yet. Will try to set: ~p later.", [Lock]),
+            erlang:send_after(250, ?MODULE, {set_concurrency_limit, Lock, Limit});
+        _ ->
+            lager:info("Registered lock: ~p", [Lock]),
+            ok
+    end.
+
+%% @private
 -spec get_vnode(Idx::integer() | [integer()], Mod::term(), State:: #state{}) ->
           pid() | [pid()].
 get_vnode(Idx, Mod, State) when not is_list(Idx) ->
@@ -583,6 +617,9 @@ get_vnode(IdxList, Mod, State) ->
                  {ok, Pid} =
                      riak_core_vnode_sup:start_vnode(Mod, Idx, ForwardTo),
                  lager:debug("Started VNode, waiting for initialization to complete ~p, ~p ", [Pid, Idx]),
+                 %% register per-vnode concurrency limit "lock" with 1 so that only a single participating
+                 %% subsystem can run a vnode fold at a time. Participation is voluntary :-)
+                 try_set_concurrency_limit(?VNODE_LOCK(Idx), 1),
                  ok = riak_core_vnode:wait_for_init(Pid),
                  lager:debug("VNode initialization ready ~p, ~p", [Pid, Idx]),
                  {Idx, Pid}
