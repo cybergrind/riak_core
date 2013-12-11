@@ -567,36 +567,6 @@ delmon(MonRef, _State=#state{idxtab=T}) ->
 add_vnode_rec(I,  _State=#state{idxtab=T}) -> ets:insert(T,I).
 
 %% @private
-%% @doc Try to register a per-vnode concurrency limit "lock" for Idx. If the
-%%      background manager is not available yet, schedule a retry for later.
-%%      If the application environment has a non "false" setting of the key
-%%      'skip_background_manager', then this code just returns ok without
-%%      registering.
-try_set_concurrency_limit(Lock, Limit) ->
-    UseBgMgr =
-        case application:get_env(riak_core, skip_background_manager) of
-            {ok, false} -> true;
-            {ok, _Other} -> false;
-            undefined -> true
-        end,
-    try_set_concurrency_limit(Lock, Limit, UseBgMgr).
-
-try_set_concurrency_limit(_Lock, _Limit, false) ->
-    lager:info("Skipping background manager."),
-    ok;
-try_set_concurrency_limit(Lock, Limit, true) ->
-    %% this is ok to do more than once
-    case riak_core_bg_manager:set_concurrency_limit(Lock, Limit) of
-        0 ->
-            %% not ready yet, try again later
-            lager:info("Background manager not ready yet. Will try to set: ~p later.", [Lock]),
-            erlang:send_after(250, ?MODULE, {set_concurrency_limit, Lock, Limit});
-        _ ->
-            lager:info("Registered lock: ~p", [Lock]),
-            ok
-    end.
-
-%% @private
 -spec get_vnode(Idx::integer() | [integer()], Mod::term(), State:: #state{}) ->
           pid() | [pid()].
 get_vnode(Idx, Mod, State) when not is_list(Idx) ->
@@ -617,9 +587,7 @@ get_vnode(IdxList, Mod, State) ->
                  {ok, Pid} =
                      riak_core_vnode_sup:start_vnode(Mod, Idx, ForwardTo),
                  lager:debug("Started VNode, waiting for initialization to complete ~p, ~p ", [Pid, Idx]),
-                 %% register per-vnode concurrency limit "lock" with 1 so that only a single participating
-                 %% subsystem can run a vnode fold at a time. Participation is voluntary :-)
-                 try_set_concurrency_limit(?VNODE_LOCK(Idx), 1),
+                 try_set_vnode_lock_limit(Idx),
                  ok = riak_core_vnode:wait_for_init(Pid),
                  lager:debug("VNode initialization ready ~p, ~p", [Pid, Idx]),
                  {Idx, Pid}
@@ -1027,3 +995,45 @@ kill_repair(Repair, Reason) ->
     riak_core_handoff_manager:kill_xfer(node(),
                                         {Mod, undefined, Partition},
                                         Reason).
+
+%% @private
+%% @doc Query the application environment for 'vnode_lock_concurrency', and if it's an
+%%      integer, use it to set the maximum vnode lock concurrency.
+try_set_vnode_lock_limit(Idx) ->
+    %% register per-vnode concurrency limit "lock" with 1 so that only a single participating
+    %% subsystem can run a vnode fold at a time. Participation is voluntary :-)
+    Concurrency = case app_helper:get_env(riak_core, vnode_lock_concurrency, 1) of
+                      N when is_integer(N) -> N;
+                      _NotNumber -> 1
+                  end,
+    try_set_concurrency_limit(?VNODE_LOCK(Idx), Concurrency).
+
+%% @private
+%% @doc Try to register a per-vnode concurrency limit "lock" for Idx. If the
+%%      background manager is not available yet, schedule a retry for later.
+%%      If the application environment has a non "false" setting of the key
+%%      'skip_background_manager', then this code just returns ok without
+%%      registering.
+try_set_concurrency_limit(Lock, Limit) ->
+    UseBgMgr =
+        case application:get_env(riak_core, skip_background_manager) of
+            {ok, false} -> true;
+            {ok, _Other} -> false;
+            undefined -> true
+        end,
+    try_set_concurrency_limit(Lock, Limit, UseBgMgr).
+
+try_set_concurrency_limit(_Lock, _Limit, false) ->
+    lager:debug("Skipping background manager."),
+    ok;
+try_set_concurrency_limit(Lock, Limit, true) ->
+    %% this is ok to do more than once
+    case riak_core_bg_manager:set_concurrency_limit(Lock, Limit) of
+        0 ->
+            %% not ready yet, try again later
+            lager:debug("Background manager not ready yet. Will try to set: ~p later.", [Lock]),
+            erlang:send_after(250, ?MODULE, {set_concurrency_limit, Lock, Limit});
+        _ ->
+            lager:debug("Registered lock: ~p", [Lock]),
+            ok
+    end.
